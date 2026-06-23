@@ -42,12 +42,15 @@ from monitor_web.data_migrate import (
     export_auto_increment_to_directory,
     export_biz_data_to_directory,
     import_biz_data_from_directory,
+    install_biz_bk_collector,
     replace_cluster_id_in_directory,
     replace_tenant_id_in_directory,
+    refresh_biz_bk_collector_proxy_configs,
     restore_disabled_models_in_directory,
     sanitize_cluster_info_in_directory,
     upload_export_directory_to_storage,
 )
+from monitor_web.data_migrate.bk_collector import CONFIG_TYPES as BK_COLLECTOR_CONFIG_TYPES
 from monitor_web.data_migrate.handler.model_disable import MODEL_DISABLE_HANDLERS
 
 FIXED_CLOSE_MODEL_LABELS: tuple[str, ...] = tuple(MODEL_DISABLE_HANDLERS.keys())
@@ -81,6 +84,9 @@ class Command(BaseCommand):
             "  导入后按业务执行重建脚本:\n"
             "    python manage.py data_migrate rebuild --bk-tenant-id tencent --bk-biz-ids 18901\n"
             "\n"
+            "  导入后按业务执行重建脚本，并单独指定 APM Kafka / ES:\n"
+            "    python manage.py data_migrate rebuild --bk-tenant-id tencent --bk-biz-ids 18901 --apm-kafka-cluster-name apm-kafka-public-1 --apm-es-cluster-name apm-es-public-1\n"
+            "\n"
             "  查询业务下需要添加双写路由的数据 ID:\n"
             "    python manage.py data_migrate find-custom-report-data-ids --bk-tenant-id tencent --bk-biz-ids 18901\n"
             "\n"
@@ -112,7 +118,13 @@ class Command(BaseCommand):
             "    python manage.py data_migrate restore-disabled-models --directory /tmp/bkmonitor-data-migrate-20260307120000\n"
             "\n"
             "  停用业务下拨测、插件采集和 k8s 采集任务:\n"
-            "    python manage.py data_migrate stop-biz-subscription-tasks --bk-tenant-id tencent --bk-biz-ids 18901 --operator admin"
+            "    python manage.py data_migrate stop-biz-subscription-tasks --bk-tenant-id tencent --bk-biz-ids 18901 --operator admin\n"
+            "\n"
+            "  为业务下 proxy 安装 bk-collector:\n"
+            "    python manage.py data_migrate install-biz-bk-collector --bk-tenant-id tencent --bk-biz-ids 18901 --operator admin\n"
+            "\n"
+            "  触发业务下 proxy 的 bk-collector 配置下发:\n"
+            "    python manage.py data_migrate refresh-biz-bk-collector-configs --bk-tenant-id tencent --bk-biz-ids 18901 --config-types apm_application custom_report log"
         )
         parser.add_argument(
             "action",
@@ -131,6 +143,8 @@ class Command(BaseCommand):
                 "disable-models",
                 "restore-disabled-models",
                 "stop-biz-subscription-tasks",
+                "install-biz-bk-collector",
+                "refresh-biz-bk-collector-configs",
             ],
             help="执行导出、导入、恢复游标或 handler 处理",
         )
@@ -140,7 +154,13 @@ class Command(BaseCommand):
             "--bk-biz-ids",
             nargs="+",
             type=int,
-            help="业务 ID 列表；export/import 中 0 代表全局数据，enable-closed-strategies 仅支持正整数业务 ID",
+            help=(
+                "业务 ID 列表；export/import 中 0 代表全局数据；"
+                "rebuild 支持正数和负数业务 ID，负数业务会跳过内置系统数据、拨测和采集插件重建；"
+                "find-custom-report-data-ids 支持正数和负数业务 ID；"
+                "enable-closed-strategies 支持正数和负数业务 ID；"
+                "stop-biz-subscription-tasks 会跳过负数业务 ID"
+            ),
         )
         parser.add_argument("--format", default="json", help="导出文件格式，默认 json；仅 export 动作需要")
         parser.add_argument("--indent", type=int, default=2, help="导出文件缩进，默认 2；仅 export 动作需要")
@@ -193,6 +213,17 @@ class Command(BaseCommand):
             help="事件 ES 集群名称；仅 rebuild 动作需要",
         )
         parser.add_argument(
+            "--apm-kafka-cluster-name",
+            help=(
+                "APM Kafka 集群名称；仅 rebuild 动作需要。"
+                "为空时保持原有逻辑：APM trace/log 使用日志 Kafka，APM metric 使用指标 Kafka"
+            ),
+        )
+        parser.add_argument(
+            "--apm-es-cluster-name",
+            help="APM trace/log ES 集群名称；仅 rebuild 动作需要。为空时保持原有逻辑：使用日志 ES",
+        )
+        parser.add_argument(
             "--data-id-infos",
             help="数据 ID 信息 JSON 或 JSON 文件路径；仅 add-migrate-data-id-routes 动作需要",
         )
@@ -204,12 +235,18 @@ class Command(BaseCommand):
         parser.add_argument(
             "--operator",
             default="system",
-            help="操作人；仅 stop-biz-subscription-tasks 动作需要",
+            help="操作人；仅 stop-biz-subscription-tasks、install-biz-bk-collector、refresh-biz-bk-collector-configs 动作需要",
         )
         parser.add_argument(
             "--dry-run",
             action="store_true",
-            help="仅预览不执行停用；仅 stop-biz-subscription-tasks 动作需要",
+            help="仅预览不执行；仅 stop-biz-subscription-tasks、install-biz-bk-collector、refresh-biz-bk-collector-configs 动作需要",
+        )
+        parser.add_argument(
+            "--config-types",
+            nargs="+",
+            choices=BK_COLLECTOR_CONFIG_TYPES,
+            help="需要刷新的 bk-collector 配置类型；仅 refresh-biz-bk-collector-configs 动作需要",
         )
 
     def handle(self, *args, **options):
@@ -229,6 +266,8 @@ class Command(BaseCommand):
             "disable-models": self._handle_disable_models,
             "restore-disabled-models": self._handle_restore_disabled_models,
             "stop-biz-subscription-tasks": self._handle_stop_biz_subscription_tasks,
+            "install-biz-bk-collector": self._handle_install_biz_bk_collector,
+            "refresh-biz-bk-collector-configs": self._handle_refresh_biz_bk_collector_configs,
         }
         handlers[action](options)
 
@@ -298,11 +337,13 @@ class Command(BaseCommand):
 
     def _handle_rebuild(self, options):
         bk_tenant_id = self._load_bk_tenant_id(options.get("bk_tenant_id"), action_name="rebuild")
-        bk_biz_ids = self._load_positive_biz_ids(options.get("bk_biz_ids"), action_name="rebuild")
+        bk_biz_ids = self._load_non_zero_biz_ids(options.get("bk_biz_ids"), action_name="rebuild")
         metric_kafka_cluster_name = options["metric_kafka_cluster_name"]
         log_kafka_cluster_name = options["log_kafka_cluster_name"]
         log_es_cluster_name = options["log_es_cluster_name"]
         event_es_cluster_name = options["event_es_cluster_name"]
+        apm_kafka_cluster_name = self._load_optional_cluster_name(options.get("apm_kafka_cluster_name"))
+        apm_es_cluster_name = self._load_optional_cluster_name(options.get("apm_es_cluster_name"))
 
         self.stdout.write(
             self.style.SUCCESS(
@@ -311,11 +352,14 @@ class Command(BaseCommand):
                 f"metric_kafka_cluster_name={metric_kafka_cluster_name}, "
                 f"log_kafka_cluster_name={log_kafka_cluster_name}, "
                 f"log_es_cluster_name={log_es_cluster_name}, "
-                f"event_es_cluster_name={event_es_cluster_name}"
+                f"event_es_cluster_name={event_es_cluster_name}, "
+                f"apm_kafka_cluster_name={apm_kafka_cluster_name}, "
+                f"apm_es_cluster_name={apm_es_cluster_name}"
             )
         )
 
         for bk_biz_id in bk_biz_ids:
+            is_negative_biz = bk_biz_id < 0
             self.stdout.write(self.style.SUCCESS(f"rebuild started: bk_biz_id={bk_biz_id}"))
             self.stdout.write(self.style.SUCCESS(f"rebuild dashboard started: bk_biz_id={bk_biz_id}"))
             rebuild_dashboard(bk_biz_id)
@@ -326,25 +370,47 @@ class Command(BaseCommand):
                 bk_biz_id=bk_biz_id,
                 kafka_cluster_name=log_kafka_cluster_name,
                 es_cluster_name=log_es_cluster_name,
+                apm_kafka_cluster_name=apm_kafka_cluster_name,
+                apm_es_cluster_name=apm_es_cluster_name,
             )
             self.stdout.write(self.style.SUCCESS(f"rebuild bklog data source route completed: bk_biz_id={bk_biz_id}"))
-            self.stdout.write(self.style.SUCCESS(f"rebuild system data started: bk_biz_id={bk_biz_id}"))
-            rebuild_system_data(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
-            self.stdout.write(self.style.SUCCESS(f"rebuild system data completed: bk_biz_id={bk_biz_id}"))
-            self.stdout.write(self.style.SUCCESS(f"rebuild uptime check started: bk_biz_id={bk_biz_id}"))
-            rebuild_uptime_check(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
-            self.stdout.write(self.style.SUCCESS(f"rebuild uptime check completed: bk_biz_id={bk_biz_id}"))
-            self.stdout.write(self.style.SUCCESS(f"rebuild collect plugins started: bk_biz_id={bk_biz_id}"))
-            rebuild_collect_plugins(
-                bk_tenant_id=bk_tenant_id,
-                bk_biz_id=bk_biz_id,
-                kafka_cluster_names={
-                    "metric": metric_kafka_cluster_name,
-                    "event": log_kafka_cluster_name,
-                },
-                es_cluster_names={"event": event_es_cluster_name},
-            )
-            self.stdout.write(self.style.SUCCESS(f"rebuild collect plugins completed: bk_biz_id={bk_biz_id}"))
+            if is_negative_biz:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"rebuild system data skipped: bk_biz_id={bk_biz_id}, "
+                        "reason=negative biz id has no bkcc builtin datalink"
+                    )
+                )
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"rebuild uptime check skipped: bk_biz_id={bk_biz_id}, "
+                        "reason=negative biz id has no uptime check tasks"
+                    )
+                )
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"rebuild collect plugins skipped: bk_biz_id={bk_biz_id}, "
+                        "reason=negative biz id has no collect configs"
+                    )
+                )
+            else:
+                self.stdout.write(self.style.SUCCESS(f"rebuild system data started: bk_biz_id={bk_biz_id}"))
+                rebuild_system_data(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
+                self.stdout.write(self.style.SUCCESS(f"rebuild system data completed: bk_biz_id={bk_biz_id}"))
+                self.stdout.write(self.style.SUCCESS(f"rebuild uptime check started: bk_biz_id={bk_biz_id}"))
+                rebuild_uptime_check(bk_tenant_id=bk_tenant_id, bk_biz_id=bk_biz_id)
+                self.stdout.write(self.style.SUCCESS(f"rebuild uptime check completed: bk_biz_id={bk_biz_id}"))
+                self.stdout.write(self.style.SUCCESS(f"rebuild collect plugins started: bk_biz_id={bk_biz_id}"))
+                rebuild_collect_plugins(
+                    bk_tenant_id=bk_tenant_id,
+                    bk_biz_id=bk_biz_id,
+                    kafka_cluster_names={
+                        "metric": metric_kafka_cluster_name,
+                        "event": log_kafka_cluster_name,
+                    },
+                    es_cluster_names={"event": event_es_cluster_name},
+                )
+                self.stdout.write(self.style.SUCCESS(f"rebuild collect plugins completed: bk_biz_id={bk_biz_id}"))
             self.stdout.write(self.style.SUCCESS(f"rebuild k8s data started: bk_biz_id={bk_biz_id}"))
             rebuild_k8s_data(
                 bk_tenant_id=bk_tenant_id,
@@ -361,13 +427,14 @@ class Command(BaseCommand):
                 metric_kafka_cluster_name=metric_kafka_cluster_name,
                 event_kafka_cluster_name=log_kafka_cluster_name,
                 es_cluster_name=event_es_cluster_name,
+                apm_kafka_cluster_name=apm_kafka_cluster_name,
             )
             self.stdout.write(self.style.SUCCESS(f"rebuild custom report completed: bk_biz_id={bk_biz_id}"))
             self.stdout.write(self.style.SUCCESS(f"rebuild completed: bk_biz_id={bk_biz_id}"))
 
     def _handle_find_custom_report_data_ids(self, options) -> None:
         bk_tenant_id = self._load_bk_tenant_id(options.get("bk_tenant_id"), action_name="find-custom-report-data-ids")
-        bk_biz_ids = self._load_positive_biz_ids(options.get("bk_biz_ids"), action_name="find-custom-report-data-ids")
+        bk_biz_ids = self._load_non_zero_biz_ids(options.get("bk_biz_ids"), action_name="find-custom-report-data-ids")
         data_id_infos = find_biz_custom_report_data_ids(bk_tenant_id=bk_tenant_id, bk_biz_ids=bk_biz_ids)
         self.stdout.write(json.dumps(data_id_infos, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -390,7 +457,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(f"update migrate data id routes completed: {len(route_changes)}"))
 
     def _handle_enable_closed_strategies(self, options) -> None:
-        bk_biz_ids = self._load_positive_biz_ids(options.get("bk_biz_ids"), action_name="enable-closed-strategies")
+        bk_biz_ids = self._load_non_zero_biz_ids(options.get("bk_biz_ids"), action_name="enable-closed-strategies")
         enable_results = enable_closed_strategies_from_application_config(bk_biz_ids=bk_biz_ids)
         self.stdout.write(json.dumps(enable_results, ensure_ascii=False, indent=2, sort_keys=True))
         enabled_count = sum(result["enabled_count"] for result in enable_results.values())
@@ -454,7 +521,7 @@ class Command(BaseCommand):
 
     def _handle_stop_biz_subscription_tasks(self, options) -> None:
         bk_tenant_id = self._load_bk_tenant_id(options.get("bk_tenant_id"), action_name="stop-biz-subscription-tasks")
-        bk_biz_ids = self._load_positive_biz_ids(options.get("bk_biz_ids"), action_name="stop-biz-subscription-tasks")
+        bk_biz_ids = self._load_non_zero_biz_ids(options.get("bk_biz_ids"), action_name="stop-biz-subscription-tasks")
         operator = self._load_operator(options.get("operator"), action_name="stop-biz-subscription-tasks")
         result = stop_biz_subscription_tasks(
             bk_tenant_id=bk_tenant_id,
@@ -470,6 +537,54 @@ class Command(BaseCommand):
             )
         else:
             self.stdout.write(self.style.SUCCESS("stop biz subscription tasks completed"))
+
+    def _handle_install_biz_bk_collector(self, options) -> None:
+        bk_tenant_id = self._load_bk_tenant_id(options.get("bk_tenant_id"), action_name="install-biz-bk-collector")
+        bk_biz_ids = self._load_positive_biz_ids(options.get("bk_biz_ids"), action_name="install-biz-bk-collector")
+        operator = self._load_operator(options.get("operator"), action_name="install-biz-bk-collector")
+        result = install_biz_bk_collector(
+            bk_tenant_id=bk_tenant_id,
+            bk_biz_ids=bk_biz_ids,
+            operator=operator,
+            dry_run=options.get("dry_run", False),
+        )
+        self._write_report_result(
+            result,
+            success_message="install biz bk-collector completed",
+            warning_message="install biz bk-collector completed with failures",
+        )
+
+    def _handle_refresh_biz_bk_collector_configs(self, options) -> None:
+        bk_tenant_id = self._load_bk_tenant_id(
+            options.get("bk_tenant_id"), action_name="refresh-biz-bk-collector-configs"
+        )
+        bk_biz_ids = self._load_positive_biz_ids(
+            options.get("bk_biz_ids"), action_name="refresh-biz-bk-collector-configs"
+        )
+        operator = self._load_operator(options.get("operator"), action_name="refresh-biz-bk-collector-configs")
+        try:
+            result = refresh_biz_bk_collector_proxy_configs(
+                bk_tenant_id=bk_tenant_id,
+                bk_biz_ids=bk_biz_ids,
+                config_types=options.get("config_types"),
+                operator=operator,
+                dry_run=options.get("dry_run", False),
+            )
+        except ValueError as error:
+            raise CommandError(str(error)) from error
+        self._write_report_result(
+            result,
+            success_message="refresh biz bk-collector configs completed",
+            warning_message="refresh biz bk-collector configs completed with failures",
+        )
+
+    def _write_report_result(self, result: dict[str, Any], *, success_message: str, warning_message: str) -> None:
+        self.stdout.write(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        failed_count = result["summary"]["total"]["failed_count"]
+        if failed_count:
+            self.stdout.write(self.style.WARNING(f"{warning_message}: {failed_count}"))
+        else:
+            self.stdout.write(self.style.SUCCESS(success_message))
 
     def _import_from_directory(self, directory: Path, options) -> None:
         """从已解压目录执行数据导入。"""
@@ -560,12 +675,24 @@ class Command(BaseCommand):
 
     def _load_positive_biz_ids(self, bk_biz_ids: list[int] | None, action_name: str) -> list[int]:
         """校验仅支持正整数业务 ID 的动作入参。"""
-        normalized_bk_biz_ids = list(dict.fromkeys(int(bk_biz_id) for bk_biz_id in (bk_biz_ids or [])))
-        if not normalized_bk_biz_ids:
-            raise CommandError(f"{action_name} 动作必须提供 --bk-biz-ids")
+        normalized_bk_biz_ids = self._load_biz_ids(bk_biz_ids, action_name=action_name)
         invalid_bk_biz_ids = [bk_biz_id for bk_biz_id in normalized_bk_biz_ids if bk_biz_id <= 0]
         if invalid_bk_biz_ids:
             raise CommandError(f"{action_name} 动作不支持这些业务 ID: {invalid_bk_biz_ids}")
+        return normalized_bk_biz_ids
+
+    def _load_non_zero_biz_ids(self, bk_biz_ids: list[int] | None, action_name: str) -> list[int]:
+        """校验支持正负业务 ID 但不支持全局 0 的动作入参。"""
+        normalized_bk_biz_ids = self._load_biz_ids(bk_biz_ids, action_name=action_name)
+        if 0 in normalized_bk_biz_ids:
+            raise CommandError(f"{action_name} 动作不支持这些业务 ID: [0]")
+        return normalized_bk_biz_ids
+
+    def _load_biz_ids(self, bk_biz_ids: list[int] | None, action_name: str) -> list[int]:
+        """校验并去重业务 ID 入参。"""
+        normalized_bk_biz_ids = list(dict.fromkeys(int(bk_biz_id) for bk_biz_id in (bk_biz_ids or [])))
+        if not normalized_bk_biz_ids:
+            raise CommandError(f"{action_name} 动作必须提供 --bk-biz-ids")
         return normalized_bk_biz_ids
 
     def _load_data_id_infos(self, raw_data_id_infos: str | None) -> dict[int, dict[str, Any]]:
@@ -641,6 +768,11 @@ class Command(BaseCommand):
         if not kafka_cluster_name:
             raise CommandError(f"{action_name} 动作必须提供 --kafka-cluster-name")
         return kafka_cluster_name
+
+    def _load_optional_cluster_name(self, raw_cluster_name: str | None) -> str | None:
+        """规范化可选集群名称，空值表示沿用旧逻辑。"""
+        cluster_name = str(raw_cluster_name or "").strip()
+        return cluster_name or None
 
     def _load_operator(self, raw_operator: str | None, action_name: str) -> str:
         """校验操作人参数。"""
