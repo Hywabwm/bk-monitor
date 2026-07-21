@@ -89,7 +89,7 @@ import type { SelectOptions } from '@blueking/tdesign-ui/.';
 
 const ALARM_CENTER_SHOW_FAVORITE = 'ALARM_CENTER_SHOW_FAVORITE';
 
-import { Alert, Loading, Message, Sideslider } from 'bkui-vue';
+import { Alert, Message, Sideslider } from 'bkui-vue';
 import dayjs from 'dayjs';
 import difference from 'lodash/difference';
 import intersection from 'lodash/intersection';
@@ -118,13 +118,7 @@ import {
 import { saveAlertContentName } from './services/alert-services';
 import EmptyStatus from '@/components/empty-status/empty-status';
 
-import type {
-  IssueDetail,
-  IssueItem,
-  IssuePriorityType,
-  IssuesBatchActionType,
-  TrendRangeType,
-} from './alarm-issues/typing';
+import type { IssueItem, IssuePriorityType, IssuesBatchActionType, TrendRangeType } from './alarm-issues/typing';
 import type { AlertSavePromiseEvent } from './components/alarm-table/components/alert-content-detail/alert-content-detail';
 
 import './alarm-center.scss';
@@ -143,12 +137,9 @@ export default defineComponent({
     const route = useRoute();
     const alarmStore = useAlarmCenterStore();
     const appStore = useAppStore();
-    const pageLoading = shallowRef(false);
     const apmHooks = inject<AlarmCenterApmHooks | null>(ALARM_CENTER_APM_HOOKS_KEY, null);
     /** table 选中的 rowKey 数组 */
     const selectedRowKeys = shallowRef<string[]>([]);
-    // 当前创建tapd的issue详情
-    const createTapdIssueDetail = shallowRef<IssueDetail>(null);
     /** 是否有选中行 */
     const hasSelection = computed(() => selectedRowKeys.value.length > 0);
 
@@ -784,10 +775,9 @@ export default defineComponent({
 
     function handleDetailShowChange(show: boolean) {
       alarmDetailShow.value = show;
-      if (!show) {
-        detailId.value = '';
-        alarmDetailDefaultTab.value = '';
-      }
+      if (show) return;
+      detailId.value = '';
+      alarmDetailDefaultTab.value = '';
     }
 
     /**
@@ -864,11 +854,8 @@ export default defineComponent({
     const tapdBizId = shallowRef<number | string>(null);
     const tapdIssueId = shallowRef('');
     const issuesTapdShow = shallowRef(false);
-    const handleIssuesTapdShowChange = (show: boolean, detail = null) => {
+    const handleIssuesTapdShowChange = (show: boolean) => {
       if (show) {
-        if (detail) {
-          createTapdIssueDetail.value = detail;
-        }
         tapdBizId.value = detailBizId.value;
         tapdIssueId.value = detailId.value;
       }
@@ -1113,7 +1100,6 @@ export default defineComponent({
       setUrlParams();
     });
     return {
-      pageLoading,
       apmHooks,
       isFirstInit,
       quickFilterList,
@@ -1240,7 +1226,6 @@ export default defineComponent({
       tapdBizId,
       tapdIssueId,
       handleIssuesTapdShowChange,
-      createTapdIssueDetail,
     };
   },
   render() {
@@ -1265,11 +1250,7 @@ export default defineComponent({
         : undefined;
     };
     return (
-      <Loading
-        class='alarm-center-page'
-        loading={this.pageLoading}
-        zIndex={9999}
-      >
+      <div class='alarm-center-page'>
         <div
           style={{ display: this.isShowFavorite ? 'block' : 'none' }}
           class='alarm-center-favorite-box'
@@ -1558,12 +1539,8 @@ export default defineComponent({
               <IssuesTapd
                 key='issues-tapd'
                 bizId={this.tapdBizId}
-                issueDetail={this.createTapdIssueDetail}
                 issuesId={this.tapdIssueId}
                 show={this.issuesTapdShow}
-                onUpdate:loading={loading => {
-                  this.pageLoading = loading;
-                }}
                 onUpdate:show={this.handleIssuesTapdShowChange}
               />,
             ]
@@ -1647,7 +1624,7 @@ export default defineComponent({
             renderFavoriteQuery: renderFavoriteQuery(this.favoriteType),
           }}
         </EditFavorite>
-      </Loading>
+      </div>
     );
   },
 });
