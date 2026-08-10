@@ -283,6 +283,89 @@ class ClusterInfo(models.Model):
                 ),
             )
 
+    def check_connectivity(self, timeout: int | None = None) -> dict[str, Any]:
+        """仅检查 ES/Doris 集群能否建立连接，不采集健康、节点或容量信息。"""
+
+        if timeout is None:
+            timeout = self.DEFAULT_CHECK_TIMEOUT
+        checker_name = {
+            self.TYPE_ES: "_check_es_connectivity",
+            self.TYPE_DORIS: "_check_doris_connectivity",
+        }.get(self.cluster_type)
+
+        if not checker_name:
+            return {
+                "is_connected": False,
+                "error": self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_UNSUPPORTED_CLUSTER_TYPE,
+                    message=f"暂不支持检查集群连通性: {self.cluster_type}",
+                    details={"cluster_type": self.cluster_type},
+                ),
+            }
+
+        try:
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+                raise ValueError("timeout 必须是大于 0 的整数")
+            getattr(self, checker_name)(timeout=timeout)
+        except ValueError as error:
+            return {
+                "is_connected": False,
+                "error": self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_INVALID_CONFIG,
+                    message="集群连接配置不完整或不合法",
+                    details=self._format_check_exception(error),
+                ),
+            }
+        except Exception as error:  # pylint: disable=broad-except
+            logger.exception(
+                "ClusterInfo.check_connectivity failed, cluster_id->[%s], cluster_type->[%s]",
+                self.cluster_id,
+                self.cluster_type,
+            )
+            return {
+                "is_connected": False,
+                "error": self._build_cluster_check_error(
+                    code=self.CHECK_ERROR_CONNECTION_FAILED,
+                    message="集群连接失败",
+                    details=self._format_check_exception(error),
+                ),
+            }
+        return {"is_connected": True, "error": None}
+
+    def _check_es_connectivity(self, timeout: int) -> None:
+        client = es_tools.get_client_by_datasource_info(
+            {
+                "port": self.port,
+                "schema": self.schema,
+                "version": self.version,
+                "domain_name": self.domain_name,
+                "is_ssl_verify": self.is_ssl_verify,
+                "auth_info": {"password": self.password, "username": self.username},
+            }
+        )
+        if not client.ping(params={"request_timeout": timeout}):
+            raise ConnectionError("Elasticsearch ping 失败")
+
+    def _check_doris_connectivity(self, timeout: int) -> None:
+        self._validate_check_endpoint()
+        connection = pymysql.connect(
+            host=self.domain_name,
+            port=int(self.port),
+            user=self.username or "",
+            password=self.password or "",
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+        finally:
+            connection.close()
+
     def _build_cluster_check_result(
         self,
         status: str,
@@ -2946,18 +3029,19 @@ class ESStorage(models.Model, StorageResultTable):
     def search_format_v1(self):
         return f"{self.index_name}_*"
 
-    def index_exist(self):
+    def index_exist(self, request_timeout: int | None = None):
         """
         判断该index是否已经存在,优先v2，随后v1
         :return: True | False
         """
-        stat_info_list = self.es_client.indices.stats(self.search_format_v2())
+        request_kwargs = {"request_timeout": request_timeout} if request_timeout is not None else {}
+        stat_info_list = self.es_client.indices.stats(self.search_format_v2(), **request_kwargs)
         for stat_index_name in list(stat_info_list["indices"].keys()):
             re_result = self.index_re_v2.match(stat_index_name)
             if re_result:
                 logger.debug("table_id->[%s] found v2 index list->[%s]", self.table_id, str(stat_info_list))
                 return True
-        stat_info_list = self.es_client.indices.stats(self.search_format_v1())
+        stat_info_list = self.es_client.indices.stats(self.search_format_v1(), **request_kwargs)
         for stat_index_name in list(stat_info_list["indices"].keys()):
             re_result = self.index_re_v1.match(stat_index_name)
             if re_result:
@@ -2966,11 +3050,15 @@ class ESStorage(models.Model, StorageResultTable):
         logger.info("table_id->[%s] no index", self.table_id)
         return False
 
-    def _get_index_infos(self, namespaced: str) -> tuple[dict[str, dict[str, Any]], str]:
+    def _get_index_infos(
+        self, namespaced: str, request_timeout: int | None = None
+    ) -> tuple[dict[str, dict[str, Any]], str]:
         index_version = ""
         extra = {ESNamespacedClientType.CAT.value: {"format": "json"}, ESNamespacedClientType.INDICES.value: {}}[
             namespaced
         ]
+        if request_timeout is not None:
+            extra["request_timeout"] = request_timeout
         getdata = {
             ESNamespacedClientType.CAT.value: lambda d: {idx["index"]: idx for idx in d},
             ESNamespacedClientType.INDICES.value: lambda d: d["indices"],
@@ -2990,8 +3078,10 @@ class ESStorage(models.Model, StorageResultTable):
 
         return index_info_map, index_version
 
-    def get_index_names(self) -> list[str]:
-        index_info_map, index_version = self._get_index_infos(ESNamespacedClientType.CAT.value)
+    def get_index_names(self, request_timeout: int | None = None) -> list[str]:
+        index_info_map, index_version = self._get_index_infos(
+            ESNamespacedClientType.CAT.value, request_timeout=request_timeout
+        )
         if index_version == "v2":
             index_re = self.index_re_v2
         else:
@@ -3005,7 +3095,7 @@ class ESStorage(models.Model, StorageResultTable):
             index_names.append(index_name)
         return index_names
 
-    def get_index_stats(self):
+    def get_index_stats(self, request_timeout: int | None = None):
         """
         获取index的统计信息
         stats格式为：{
@@ -3020,10 +3110,10 @@ class ESStorage(models.Model, StorageResultTable):
           }
         }
         """
-        return self._get_index_infos(ESNamespacedClientType.INDICES.value)
+        return self._get_index_infos(ESNamespacedClientType.INDICES.value, request_timeout=request_timeout)
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), reraise=True)
-    def current_index_info(self):
+    def current_index_info(self, request_timeout: int | None = None):
         """
         返回当前使用的最新index相关的信息
         :return: {
@@ -3032,7 +3122,7 @@ class ESStorage(models.Model, StorageResultTable):
             "size": 123123,  # index大小，单位byte
         }
         """
-        indices, index_version = self.get_index_stats()
+        indices, index_version = self.get_index_stats(request_timeout=request_timeout)
         # 如果index_re为空，说明没找到任何可用的index
         if index_version == "":
             logger.info("index->[%s] has no index now, will raise a fake not found error", self.index_name)
@@ -3359,7 +3449,7 @@ class ESStorage(models.Model, StorageResultTable):
         if not force_move:
             for index in last_indexes:
                 index_info = es_storage.get_index_info(index)
-                if index_info["status"] == "red":
+                if index_info.get("index_status") == "red":
                     print(f"索引->[{index}]状态为red，因此要强制进行写别名的移动")
                     force_move = True
                     break
@@ -6318,7 +6408,14 @@ class DorisStorage(models.Model, StorageResultTable):
             "storage_config": spec.get("storage_config") or {},
         }
 
-    def _query_doris_physical_metadata(self, database: str, table: str, connection_config: dict[str, Any]) -> dict:
+    def _query_doris_physical_metadata(
+        self,
+        database: str,
+        table: str,
+        connection_config: dict[str, Any],
+        timeout: int = 10,
+        include_create_table: bool = True,
+    ) -> dict:
         connection = pymysql.connect(
             host=connection_config["host"],
             port=int(connection_config["port"]),
@@ -6327,9 +6424,9 @@ class DorisStorage(models.Model, StorageResultTable):
             database=database,
             charset="utf8mb4",
             cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=10,
-            read_timeout=10,
-            write_timeout=10,
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
         )
         try:
             with connection.cursor() as cursor:
@@ -6365,16 +6462,18 @@ class DorisStorage(models.Model, StorageResultTable):
                 )
                 partitions = cursor.fetchall()
 
-                quoted_table = ".".join([self._quote_doris_identifier(database), self._quote_doris_identifier(table)])
-                cursor.execute(f"SHOW CREATE TABLE {quoted_table}")
-                create_table = cursor.fetchall()
-
-                return {
+                result = {
                     "tables": tables,
                     "columns": columns,
                     "partitions": partitions,
-                    "show_create_table": create_table,
                 }
+                if include_create_table:
+                    quoted_table = ".".join(
+                        [self._quote_doris_identifier(database), self._quote_doris_identifier(table)]
+                    )
+                    cursor.execute(f"SHOW CREATE TABLE {quoted_table}")
+                    result["show_create_table"] = cursor.fetchall()
+                return result
         finally:
             connection.close()
 
@@ -6532,7 +6631,12 @@ class DorisStorage(models.Model, StorageResultTable):
 
         return result
 
-    def query_physical_storage_metadata(self, storage_cluster_id: int | None = None) -> dict[str, Any]:
+    def query_physical_storage_metadata(
+        self,
+        storage_cluster_id: int | None = None,
+        timeout: int = 10,
+        include_create_table: bool = True,
+    ) -> dict[str, Any]:
         """
         查询 DorisStorage 关联物理表的原始元信息。
 
@@ -6660,6 +6764,8 @@ class DorisStorage(models.Model, StorageResultTable):
                     database=physical_table["database"],
                     table=physical_table["table"],
                     connection_config=connection_config,
+                    timeout=timeout,
+                    include_create_table=include_create_table,
                 )
             except Exception as error:  # pylint: disable=broad-except
                 errors.append(
